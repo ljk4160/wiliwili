@@ -204,9 +204,12 @@ std::unordered_map<SettingItem, ProgramOption> ProgramConfig::SETTING_MAP = {
     {SettingItem::PS5_HDR_OUTPUT, {"ps5_hdr_output", {}, {}, 0}},
     {SettingItem::PLAYER_SKIP_OPENING_CREDITS, {"player_skip_opening_credits", {}, {}, 1}},
     {SettingItem::PLAYER_LOW_QUALITY, {"player_low_quality", {}, {}, 1}},
-#if defined(IOS) || defined(__PSV__) || defined(__SWITCH__) || defined(PS5)
+#if defined(IOS) || defined(__PSV__) || defined(__SWITCH__)
     {SettingItem::PLAYER_HWDEC, {"player_hwdec", {}, {}, 1}},
 #else
+    // Off on the PS5: the console's own decoder takes the process down when it
+    // is asked for the first frame, so playback starts on the software decoder
+    // and the switch stays available for whoever gets the hardware path working.
     {SettingItem::PLAYER_HWDEC, {"player_hwdec", {}, {}, 0}},
 #endif
     {SettingItem::PLAYER_HWDEC_CUSTOM, {"player_hwdec_custom", {}, {}, 0}},
@@ -267,8 +270,21 @@ std::unordered_map<SettingItem, ProgramOption> ProgramConfig::SETTING_MAP = {
       {1, 2, 3, 4, 8, 12, 16},
       3}},
 #endif
+#if defined(PS5)
+    // The label names the codecs the container can carry; AV1 is not one this
+    // console can decode, so it is not named here either.
+    {SettingItem::VIDEO_FORMAT, {"file_format", {"Dash (AVC/HEVC)", "FLV/MP4"}, {4048, 0}, 0}},
+#else
     {SettingItem::VIDEO_FORMAT, {"file_format", {"Dash (AVC/HEVC/AV1)", "FLV/MP4"}, {4048, 0}, 0}},
+#endif
+#if defined(PS5)
+    // The console decodes H.264 and HEVC; an AV1 stream has nothing to decode
+    // it here and opens as a black picture with the sound and the comments
+    // running, so the option is not offered on this platform.
+    {SettingItem::VIDEO_CODEC, {"video_codec", {"AVC/H.264", "HEVC/H.265"}, {7, 12}, 0}},
+#else
     {SettingItem::VIDEO_CODEC, {"video_codec", {"AVC/H.264", "HEVC/H.265", "AV1"}, {7, 12, 13}, 0}},
+#endif
     {SettingItem::AUDIO_QUALITY,
      {"audio_quality", {"Dolby Atmos", "Hi-Res", "High", "Medium", "Low"}, {30250, 30251, 30280, 30232, 30216}, WILI_AUDIO_QUALITY_DEFAULT}},
     {SettingItem::DANMAKU_FILTER_LEVEL,
@@ -311,6 +327,7 @@ std::unordered_map<SettingItem, ProgramOption> ProgramConfig::SETTING_MAP = {
     {SettingItem::HTTP_TIMEOUT, {"http_timeout", {}, {}, 0}},
     {SettingItem::HTTP_CONNECTION_TIMEOUT, {"http_connection_timeout", {}, {}, 0}},
     {SettingItem::HTTP_DNS_CACHE_TIMEOUT, {"http_dns_cache_timeout", {}, {}, 0}},
+    {SettingItem::DNS_SERVER, {"dns_server", {}, {}, 0}},
     {SettingItem::LIVE_SIDEBAR_DANMAKU_COUNT,
      {"live_sidebar_danmaku_count", {"0", "10", "25", "50", "100"}, {0, 10, 25, 50, 100}, 0}},
 
@@ -620,6 +637,12 @@ void ProgramConfig::load() {
     // 初始化视频格式
     BILI::FNVAL         = std::to_string(getIntOption(SettingItem::VIDEO_FORMAT));
     BILI::VIDEO_CODEC   = getIntOption(SettingItem::VIDEO_CODEC);
+#ifdef PS5
+    // A configuration written before the option list lost AV1 can still carry
+    // it; asking the server for a stream nothing here decodes gives a black
+    // picture, so the request goes out as HEVC instead.
+    if (BILI::VIDEO_CODEC == 13) BILI::VIDEO_CODEC = 12;
+#endif
     BILI::AUDIO_QUALITY = getIntOption(SettingItem::AUDIO_QUALITY);
 
     // 初始化搜索页样式
@@ -1074,6 +1097,40 @@ void ProgramConfig::init() {
     brls::Logger::info("wiliwili {}", APPVersion::instance().git_tag);
     wiliwili::initCrashDump();
 
+#ifdef PS5
+    // A configuration that stops the application before its window opens would
+    // do it again on every launch, and there is no way to reach the settings
+    // screen to correct it. The crash handler leaves a report behind, and a
+    // report from the first seconds of a run means the settings are what
+    // stopped it: they are moved aside so the application comes up, and the
+    // file stays on the console for inspection.
+    {
+        const std::string report = getConfigDir() + "/crash-last.txt";
+        const std::string cfg    = getConfigDir() + "/wiliwili_config.json";
+        bool diedWhileStarting    = false;
+        std::ifstream in(report);
+        if (in) {
+            std::string line;
+            while (std::getline(in, line)) {
+                const auto pos = line.find("after: ");
+                if (pos == std::string::npos) continue;
+                try {
+                    diedWhileStarting = std::stol(line.substr(pos + 7)) < 4000;
+                } catch (...) {
+                }
+                break;
+            }
+        }
+        if (in) in.close();
+        if (diedWhileStarting && access(cfg.c_str(), F_OK) == 0) {
+            const std::string saved = cfg + ".saved";
+            ::rename(cfg.c_str(), saved.c_str());
+            brls::Logger::error("[config] the last run died while starting, settings moved to {}", saved);
+        }
+        if (diedWhileStarting) ::unlink(report.c_str());
+    }
+#endif
+
     // 在窗口大小改变时检查是否需要切换到置顶模式
     brls::Application::getWindowSizeChangedEvent()->subscribe([]() { ProgramConfig::instance().checkOnTop(); });
 
@@ -1175,10 +1232,37 @@ void ProgramConfig::init() {
             VideoDetail::defaultQuality = WILI_VIDEO_QUALITY_DEFAULT;
         });
     BILI::setProxy(httpProxy, httpsProxy);
+#if defined(PS5)
+    // A verified TLS connection cannot be established on this console: libcurl
+    // looks for its trust anchors in the payload layout's
+    // /user/homebrew/etc/ca-bundle.crt, which a title does not have, and every
+    // HTTPS request then fails inside the handshake ("error adding trust
+    // anchors from file") before the server is contacted - the whole app shows
+    // as offline. Verification is off by default on this platform for that
+    // reason; a config file that carries the flag as on would silently break
+    // the network, so the platform default wins here.
+    BILI::setTlsVerify(false);
+    if (getBoolOption(SettingItem::TLS_VERIFY)) {
+        brls::Logger::error("[tls] verification requested but no CA bundle exists on this console; using no verification");
+    }
+#else
     BILI::setTlsVerify(getBoolOption(SettingItem::TLS_VERIFY));
-    BILI::setHttpTimeout(getSettingItem(SettingItem::HTTP_TIMEOUT, 5000));
+#endif
+    BILI::setHttpTimeout(getSettingItem(SettingItem::HTTP_TIMEOUT,
+#if defined(PS5)
+        // The PS5 network stack needs several seconds to bring up its first
+        // connection: musl resolves through sceNetResolver, then the TLS
+        // handshake runs on top of libcurl's socket timeouts. The stock 5 s
+        // budget expires before the first WBI request finishes, so the home
+        // screen opens on "WBI签名获取失败" every cold launch.
+        15000
+#else
+        5000
+#endif
+    ));
     BILI::setConnectionTimeout(getSettingItem(SettingItem::HTTP_CONNECTION_TIMEOUT, 0));
     BILI::setDnsCacheTimeout(getSettingItem(SettingItem::HTTP_DNS_CACHE_TIMEOUT, WILI_DNS_CACHE_TIMEOUT));
+
 }
 
 std::string ProgramConfig::getHomePath() {
@@ -1313,7 +1397,14 @@ void ProgramConfig::setProxy(const std::string& proxy) {
 }
 
 void ProgramConfig::setTlsVerify(bool verify) {
+#if defined(PS5)
+    // See ProgramConfig::init: without a CA bundle on this console a verified
+    // connection cannot be made, so the switch stays off whatever the UI says.
+    (void)verify;
+    BILI::setTlsVerify(false);
+#else
     BILI::setTlsVerify(verify);
+#endif
 }
 
 void ProgramConfig::addSeasonCustomSetting(const std::string& key, const SeasonCustomItem& item) {

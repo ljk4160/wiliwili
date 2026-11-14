@@ -128,6 +128,15 @@ void wiliwili_mark(const char *stage)
     static int handle = -2;  // -2: not opened yet, -1: nowhere to write
     static struct timespec first;
     if (handle == -2) {
+        /*
+         * A build earlier than this one had the player write a log of its own
+         * into the same folder, and one long video was enough to use up the
+         * console's storage. With no space left the application stops before
+         * its first frame, and only this process can remove the file, so it
+         * goes before anything else allocates or writes.
+         */
+        unlink("/data/wiliwili/mpv.log");
+
         clock_gettime(CLOCK_MONOTONIC, &first);
         handle = open("/data/wiliwili/startup.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
         if (handle < 0)

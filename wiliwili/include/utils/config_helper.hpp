@@ -105,6 +105,7 @@ enum class SettingItem {
     HTTP_TIMEOUT,
     HTTP_CONNECTION_TIMEOUT,
     HTTP_DNS_CACHE_TIMEOUT,
+    DNS_SERVER,  // 自定义 DNS 服务器（留空则自动）
     UP_FILTER,
     LIVE_DANMAKU_FILTER_LEVEL,
     LIVE_SIDEBAR_DANMAKU_COUNT, // 直播间侧边栏弹幕数量上限

@@ -9,8 +9,18 @@
 #include <vector>
 #include <algorithm>
 #include <map>
+#include <chrono>
+#include <thread>
 #include <cpr/cpr.h>
 #include <pystring.h>
+
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <cerrno>
+#include <cstring>
+
+#include <borealis.hpp>
 
 #include "bilibili/util/md5.hpp"
 #include "bilibili/util/http.hpp"
@@ -73,10 +83,61 @@ void updateWbiKeys(const std::function<void()>& success, const ErrorCallback& er
         return;
     }
 
-    auto session = HTTP::createSession();
-    session->SetUrl(cpr::Url{parseLink(Api::Nav)});
-    session->GetCallback([success, error, now](const cpr::Response& r) {
+    // On the PS5 the first request of a cold launch carries the whole cost of
+    // bringing the network stack up: sceNetResolver DNS, TCP connect, and the
+    // TLS handshake, all inside one timeout budget. A single attempt regularly
+    // loses that race and the home screen opens on a signature error, so the
+    // fetch retries on its own worker thread before it reports failure.
+    static constexpr int WBI_MAX_ATTEMPTS   = 3;
+    static constexpr int WBI_RETRY_DELAY_MS = 1500;
+
+    cpr::async([success, error, now]() {
+        // 每一次失败的请求都把阶段信息写进日志：DNS 解析结果、curl 错误码、
+        // HTTP 状态码、响应正文开头和本次耗时。PS5 上日志同时进文件
+        // (/data/wiliwili/wiliwili-title.log) 和控制台（klog），
+        // 这样失败发生在 DNS、TLS 还是服务端都能从日志直接读出来。
+        brls::Logger::error("[wbi] nav start: timeout={}ms connection={} verify_ssl={}",
+                            HTTP::TIMEOUT, HTTP::CONNECTION_TIMEOUT,
+                            (bool)HTTP::VERIFY);
+
+        // One session for every attempt: the connection and the DNS cache
+        // entry it already built stay warm across the retries.
+        auto session = HTTP::createSession();
+        session->SetUrl(cpr::Url{parseLink(Api::Nav)});
+
+        cpr::Response r;
+        for (int attempt = 1; attempt <= WBI_MAX_ATTEMPTS; attempt++) {
+            r = session->Get();
+
+            // DNS is what a title sandbox most often loses: report what the
+            // console's resolver answered, separately from curl's own result.
+            char dns[160] = {0};
+            struct hostent* he = ::gethostbyname("api.bilibili.com");
+            if (he && he->h_addr_list && he->h_addr_list[0]) {
+                char ip[INET_ADDRSTRLEN] = {0};
+                ::inet_ntop(AF_INET, he->h_addr_list[0], ip, sizeof(ip));
+                ::snprintf(dns, sizeof(dns), "%s", ip);
+            } else {
+                ::snprintf(dns, sizeof(dns), "FAILED h_errno=%d", h_errno);
+            }
+
+            std::string body = r.text.size() > 180 ? r.text.substr(0, 180) + "..." : r.text;
+            brls::Logger::error(
+                "[wbi] nav attempt {}/{}: status={} curl={}({}) elapsed={:.0f}ms dns={} body={}",
+                attempt, WBI_MAX_ATTEMPTS, r.status_code,
+                (int)r.error.code, r.error.message.empty() ? "-" : r.error.message,
+                r.elapsed * 1000.0, dns, body);
+
+            if (r.status_code == 200) break;
+            if (attempt < WBI_MAX_ATTEMPTS) {
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(WBI_RETRY_DELAY_MS * attempt));
+            }
+        }
+
         if (r.status_code != 200) {
+            brls::Logger::error("[wbi] nav gave up after {} attempts (last status={}, curl={})",
+                                WBI_MAX_ATTEMPTS, r.status_code, (int)r.error.code);
             ERROR_MSG("WBI签名获取失败", -412);
             return;
         }
@@ -93,11 +154,17 @@ void updateWbiKeys(const std::function<void()>& success, const ErrorCallback& er
                     g_last_update_time = now;
                 }
 
+                brls::Logger::info("[wbi] nav ok: img_key={}sub_key={} mixin_key={}",
+                                   img_key.empty() ? "<empty>" : "set, ",
+                                   sub_key.empty() ? "<empty>" : "set, ", g_mixin_key);
+
                 // 继续执行网络请求
                 success();
                 return;
             }
-        } catch (...) {
+            brls::Logger::error("[wbi] nav 200 but no wbi_img in body: {}", r.text.substr(0, 200));
+        } catch (const std::exception& e) {
+            brls::Logger::error("[wbi] nav parse error: {} body={}", e.what(), r.text.substr(0, 200));
         }
         ERROR_MSG("WBI签名失败", -412);
     });

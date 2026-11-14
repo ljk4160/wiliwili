@@ -280,6 +280,9 @@
                             <brls:InputCell
                                     id="setting/network/input"/>
 
+                            <brls:InputCell
+                                    id="setting/network/dns"/>
+
                         </brls:Box>
                     </brls:Box>
                 </brls:ScrollingFrame>

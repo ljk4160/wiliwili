@@ -447,6 +447,18 @@ void MPVCore::init() {
         mpvSetOptionString(mpv, "vd", "!h264_ps5,!hevc_ps5,auto");
         brls::Logger::info("MPV video decoder: auto (sw)");
     }
+    // A verified HTTPS stream cannot be opened on this console: ffmpeg looks
+    // for its trust anchors in a path the payload layout owns, which a title
+    // does not have, and the stream then fails to load before a single byte is
+    // read. The app's own requests run without verification for the same
+    // reason, and a video CDN address is not something to authenticate.
+    mpvSetOptionString(mpv, "tls-verify", "no");
+    // Keep the player's own warnings and errors in the application log: when a
+    // stream fails to load this is the only place that says why. The output and
+    // decode stages are verbose so a playback that stalls says which stage it
+    // stalled in, not just that the picture never arrived.
+    mpvSetOptionString(mpv, "msg-level",
+                       "cplayer=info,stream=debug,demux=debug,vd=debug,vo=debug,ao=debug");
 #else
     if (HARDWARE_DEC) {
         mpvSetOptionString(mpv, "hwdec", PLAYER_HWDEC_METHOD.c_str());
@@ -476,6 +488,16 @@ void MPVCore::init() {
     // renderer.
     mpvSetOptionString(mpv, "vd-lavc-threads", "4");
     mpvSetOptionString(mpv, "vd-lavc-fast", "yes");
+    // Direct rendering hands the decoder buffers that the picture path maps
+    // for the graphics part, and the first decoded frame then takes the
+    // process down on this console. Let the decoder keep its own frames and
+    // copy them out instead.
+    mpvSetOptionString(mpv, "vd-lavc-dr", "no");
+    // A precise seek decodes every frame between the keyframe and the target
+    // before the picture can appear, and that burst right after a file opens
+    // is where playback dies here. Seeking to the keyframe keeps the cost to
+    // one decode, at the price of landing on the nearest keyframe.
+    mpvSetOptionString(mpv, "hr-seek", "no");
     mpvSetOptionString(mpv, "demuxer-max-bytes", "32M");
     mpvSetOptionString(mpv, "demuxer-readahead-secs", "10");
     mpvSetOptionString(mpv, "cache-secs", "30");
@@ -501,7 +523,9 @@ void MPVCore::init() {
     // mpvSetOptionString(mpv, "msg-level", "all=no");
 #if defined(PS5)
     mpvSetOptionString(mpv, "terminal", "no");
-    mpvSetOptionString(mpv, "msg-level", "ffmpeg=info");
+    // Warnings and errors only: a player writing every line of a long video to
+    // the console's storage fills it up, and the whole app then fails to start.
+    mpvSetOptionString(mpv, "msg-level", "all=warn");
 #endif
     if (MPVCore::TERMINAL) {
         mpvSetOptionString(mpv, "terminal", "yes");
@@ -514,6 +538,7 @@ void MPVCore::init() {
         mpvTerminateDestroy(mpv);
         brls::fatal("Could not initialize mpv context");
     }
+
 
     // set observe properties
     check_error(mpvObserveProperty(mpv, 1, "core-idle", MPV_FORMAT_FLAG));
@@ -1250,8 +1275,15 @@ void MPVCore::eventMainLoop() {
                 // 发布一次进度更新事件，避免进度条在0秒时没有进度更新
                 video_progress = 0;
                 mpvCoreEvent.fire(MpvEventEnum::UPDATE_PROGRESS);
-                // 移除其他备用链接
+#ifndef PS5
+                // Clearing the playlist while the first entry plays makes the
+                // player re-open the stream it is already playing, and on this
+                // console that re-open is what takes the process down: the
+                // picture never arrives. The spare addresses stay in the list
+                // instead, which is harmless - looping is off, so the player
+                // never advances to them by itself.
                 command_async("playlist-clear");
+#endif
 
                 if (AUTO_PLAY) {
                     mpvCoreEvent.fire(MpvEventEnum::MPV_RESUME);

@@ -16,32 +16,37 @@ void LiveDataRequest::requestData(int roomid) {
     BILI::get_live_room_play_info(
         roomid, defaultQuality,
         [ASYNC_TOKEN](const auto& result) {
-            liveRoomPlayInfo = result;
-            qualityDescriptionMap.clear();
-            for (auto& i : liveRoomPlayInfo.playurl_info.playurl.g_qn_desc) {
-                qualityDescriptionMap[i.qn] = i.desc;
-            }
-
-            // 选择第一个 protocol 的 第一个 format 的第一个 codec 作为播放源
-            // protocol: http_stream / http_hls
-            // format: flv / ts / fmp4
-            // codec: avc / hevc / av1
-            bilibili::LiveStream stream;
-            for (auto& i : liveRoomPlayInfo.playurl_info.playurl.stream) {
-                stream = i;
-                break;
-            }
-            bilibili::LiveStreamFormat format;
-            for (auto& i : stream.format) {
-                format = i;
-                break;
-            }
-            for (auto& i : format.codec) {
-                liveUrl = i;
-                break;
-            }
-            brls::sync([ASYNC_TOKEN]() {
+            // The whole update runs on the UI thread with its own copy of the
+            // answer. Assigning the member from the worker instead let the UI
+            // thread read the quality list while it was being replaced, and the
+            // torn pointers took the process down when a room was opened on a
+            // slow connection.
+            brls::sync([ASYNC_TOKEN, result]() {
                 ASYNC_RELEASE
+                liveRoomPlayInfo = result;
+                qualityDescriptionMap.clear();
+                for (auto& i : liveRoomPlayInfo.playurl_info.playurl.g_qn_desc) {
+                    qualityDescriptionMap[i.qn] = i.desc;
+                }
+
+                // 选择第一个 protocol 的 第一个 format 的第一个 codec 作为播放源
+                // protocol: http_stream / http_hls
+                // format: flv / ts / fmp4
+                // codec: avc / hevc / av1
+                bilibili::LiveStream stream;
+                for (auto& i : liveRoomPlayInfo.playurl_info.playurl.stream) {
+                    stream = i;
+                    break;
+                }
+                bilibili::LiveStreamFormat format;
+                for (auto& i : stream.format) {
+                    format = i;
+                    break;
+                }
+                for (auto& i : format.codec) {
+                    liveUrl = i;
+                    break;
+                }
                 onLiveData(liveRoomPlayInfo);
             });
         },

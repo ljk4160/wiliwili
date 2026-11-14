@@ -42,7 +42,9 @@
         "header": "网络设置",
         "tls": "TLS 验证",
         "proxy": "网络代理",
-        "proxy_hint": "示例: http://127.0.0.1:7890"
+        "proxy_hint": "示例: http://127.0.0.1:7890",
+        "dns": "DNS 服务器",
+        "dns_hint": "留空自动(223.5.5.5)，可填 119.29.29.29"
       },
       "ui": {
         "header": "界面设置",
@@ -142,6 +144,8 @@
       "repo_header": "开源地址",
       "port_header": "PS5 移植",
       "port": "PS5 原生版本由 carlchina 移植和维护\nhttps://github.com/carlchina",
+      "ps5fix_header": "PS5移植修复版",
+      "ps5fix": "PS5移植修复版由 ljk4160 维护\nhttps://github.com/ljk4160/wiliwili",
       "author_header": "作者发言",
       "author": "一直想做个艺术家, 可惜程序员都没什么发挥的空间\n直到这个作品诞生，实现了：「在游戏机上看视频；用手机来玩游戏」\n或许算得上是一种行为艺术，这样的话我也就圆满了"
     },

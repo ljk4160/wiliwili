@@ -28,7 +28,12 @@ using namespace brls::literals;
 
 APPVersion::APPVersion() {
     git_commit = std::string(STR(BUILD_TAG_SHORT));
-#if defined(WILIWILI_BUILD_VERSION_TAG)
+#if defined(PS5)
+    // This build carries fixes the upstream release does not, so it says so on
+    // the about page and in the log instead of reporting the tag it was cut
+    // from: a report from the console then names the build that produced it.
+    git_tag    = "ps5 v1.6.1";
+#elif defined(WILIWILI_BUILD_VERSION_TAG)
     git_tag    = std::string(WILIWILI_BUILD_VERSION_TAG);
 #else
     git_tag    = std::string(STR(BUILD_TAG_VERSION));

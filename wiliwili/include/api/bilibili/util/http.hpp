@@ -6,6 +6,7 @@
 
 #include <nlohmann/json.hpp>
 #include <cpr/cpr.h>
+#include <borealis/core/logger.hpp>
 
 #ifdef PS5
 #include <sys/socket.h>
@@ -92,10 +93,16 @@ public:
      * servers never send, so the socket read only returns once the kernel
      * gives up on the connection - about two minutes later. A receive timeout
      * on the socket bounds that wait to a few seconds.
+     *
+     * The same timeout guards every read, the TLS handshake included: at three
+     * seconds a cold handshake to a distant server aborted with recv() timing
+     * out, and every request that needed one (the WBI key fetch is the first
+     * of a launch) failed before the server said anything. Ten seconds still
+     * bounds the close wait while leaving the handshake its time.
      */
     static int curlSocketOption(void* /*clientp*/, curl_socket_t fd, curlsocktype /*purpose*/) {
         struct timeval timeout;
-        timeout.tv_sec  = 3;
+        timeout.tv_sec  = 10;
         timeout.tv_usec = 0;
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
         return 0;
@@ -178,13 +185,19 @@ public:
             cpr::Session& session = workerSession();
             session.SetUrl(cpr::Url{parseLink(url)});
             session.SetParameters(parameters);
-
             const cpr::Response& r = session.Get();
             if (r.error) {
+                // A title's sandbox has no reader for a crash and no shell to
+                // curl from, so every request that fails before the server
+                // answers says where it stopped: DNS, connect, or TLS.
+                brls::Logger::error("[http] GET {} failed: curl={}({}) elapsed={:.0f}ms",
+                                    url, (int)r.error.code, r.error.message, r.elapsed * 1000.0);
                 ERROR_MSG(r.error.message, -1);
                 return;
             }
             if (r.status_code != 200) {
+                brls::Logger::error("[http] GET {} status={} body={}", url, r.status_code,
+                                    r.text.size() > 200 ? r.text.substr(0, 200) + "..." : r.text);
                 ERROR_MSG("Network error. [Status code: " + std::to_string(r.status_code) + " ]", r.status_code);
                 return;
             }
