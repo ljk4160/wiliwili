@@ -32,7 +32,7 @@ APPVersion::APPVersion() {
     // This build carries fixes the upstream release does not, so it says so on
     // the about page and in the log instead of reporting the tag it was cut
     // from: a report from the console then names the build that produced it.
-    git_tag    = "PS5 v1.6.1";
+    git_tag    = "PS5 v1.6.2";
 #elif defined(WILIWILI_BUILD_VERSION_TAG)
     git_tag    = std::string(WILIWILI_BUILD_VERSION_TAG);
 #else
