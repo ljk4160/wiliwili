@@ -454,11 +454,9 @@ void MPVCore::init() {
     mpvSetOption(mpv, "gamma", MPV_FORMAT_DOUBLE, &MPVCore::VIDEO_GAMMA);
 
 #ifdef PS5
-    // 纹理上传默认是同步的逐行拷贝，4K 一帧要 85~100ms。PBO 走异步 DMA，
-    // 是这条 GL 路径下唯一可能让原生 4K 跑起来的手段。
-    mpvSetOptionString(mpv, "opengl-pbo", "yes");
-    // 解码器直接写进 VO 的映射内存，省掉一次额外的拷贝。
-    mpvSetOptionString(mpv, "vd-lavc-dr", "yes");
+    // 不要开 opengl-pbo / vd-lavc-dr：这个驱动的 PBO 和 DR 是模拟实现，
+    // 实测比同步上传慢一个数量级（884x1920 的小视频都能吃 4900ms/s，
+    // 关掉后同样大小只要一百多毫秒）。
     // 这台机器的 GL 实现在 4K->1080p 降采样上开销极大：默认的 lanczos 每帧要
     // 110ms（60fps 下就是 6 倍实时，表现为疯狂丢帧）。双线性只要几毫秒，而 4K
     // 降采样用双线性的画质损失肉眼几乎看不出来。
@@ -1159,10 +1157,12 @@ void MPVCore::draw(brls::Rect area, float alpha) {
         static int vfApplied  = 0;
         static int prescaleOn = -1;
         if (prescaleOn < 0) {
-            prescaleOn = 0;
+            // 默认开：原生 4K 的上传在这条 GL 路径上要 85~100ms/帧，必须先缩到
+            // 1080p 才能跑满帧。想试原生 4K 就在 /data/wiliwili/prescale.txt 写 0。
+            prescaleOn = 1;
             if (FILE *f = std::fopen("/data/wiliwili/prescale.txt", "r")) {
                 int v = 0;
-                if (std::fscanf(f, "%d", &v) == 1 && v != 0) prescaleOn = 1;
+                if (std::fscanf(f, "%d", &v) == 1) prescaleOn = v != 0 ? 1 : 0;
                 std::fclose(f);
             }
             brls::Logger::info("mpv: CPU 预缩放 {} (prescale.txt)", prescaleOn ? "开" : "关");
