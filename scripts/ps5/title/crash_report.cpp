@@ -188,6 +188,18 @@ bool AfterCall(const unsigned char *bytes)
     return false;
 }
 
+// Whether the report may read the app's own code to drop the values that do
+// not follow a call instruction.
+//
+// NO. The console maps a title as execute-only, and reading such a page is not
+// a fault the process gets to handle: the kernel takes the title down and
+// reports it to the shell as 0xa0020328 (SYSTEM_XO_VIOLATION). Doing that from
+// inside the crash handler replaced every crash report with that error, which
+// is why a run that died left neither crash-last.txt nor a line in the log.
+// The values are printed with a "?" instead and symbolize_crash.py drops the
+// ones that are not return addresses.
+constexpr bool kReadCode = false;
+
 // The app's code addresses on the stack, most recent first. The console does
 // not let its code be read, so values that cannot be checked against a call
 // instruction carry a "?" and scripts/ps5/title/symbolize_crash.py checks them.
@@ -210,7 +222,8 @@ void PutCalls(std::uint64_t stack)
             if (!InCode(value) || value < CodeStart() + 8)
                 continue;
             unsigned char before[8];
-            const bool checked = Copy(reinterpret_cast<const void *>(value - 8), before, 8);
+            // 绝不能读代码段：见 kReadCode 的注释。
+            const bool checked = kReadCode && Copy(reinterpret_cast<const void *>(value - 8), before, 8);
             if (checked && !AfterCall(before))
                 continue;
             g_text.Put("  ");
@@ -242,7 +255,7 @@ std::uint64_t GetFirstCaller(std::uint64_t stack)
             if (!InCode(value) || value < CodeStart() + 8)
                 continue;
             unsigned char before[8];
-            if (Copy(reinterpret_cast<const void *>(value - 8), before, 8) && AfterCall(before))
+            if (kReadCode && Copy(reinterpret_cast<const void *>(value - 8), before, 8) && AfterCall(before))
                 return value;
         }
     }

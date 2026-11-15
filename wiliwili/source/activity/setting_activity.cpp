@@ -272,7 +272,8 @@ void SettingActivity::onContentAvailable() {
 
     labelAboutVersion->setText(
 #if defined(PS5)
-        "PS5 " + version
+        // version 里已经带了平台（PS5 v1.6.1），再加前缀会显示成 "PS5 PS5 v1.6.1"
+        version
 #else
         version
 #if defined(BOREALIS_USE_DEKO3D)

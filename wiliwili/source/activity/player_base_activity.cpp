@@ -597,21 +597,18 @@ void BasePlayerActivity::onVideoPlayUrl(const bilibili::VideoUrlResult& result) 
         // dash
         brls::Logger::debug("Video type: dash");
 
-        // 找到当前可用的清晰度
+        // 找到当前可用的清晰度。
+        // 必须取「所有不高于目标值的流里 id 最大的那个」：接口返回的 dash.video
+        // 顺序没有保证，原来取"第一个满足条件的"在升序排列时会直接命中最低的一档
+        // （请求 1080P 却得到 480P），这也是"有的视频能切清晰度、有的不能"的原因。
+        int bestQuality = 0;
         for (const auto& i : result.dash.video) {
-            int desiredQuality = result.quality;
             // 若设置了过高的清晰度, 自动切换到合适的清晰度, 默认为 128 (即无限制)
-            if (i.height > i.width) {
-                desiredQuality = std::min(desiredQuality, portraitQualityMax);
-            } else {
-                desiredQuality = std::min(desiredQuality, landscapeQualityMax);
-            }
-
-            if (desiredQuality >= i.id) {
-                videoUrlResult.quality = i.id;
-                break;
-            }
+            int desiredQuality = (i.height > i.width) ? std::min((int)result.quality, portraitQualityMax)
+                                                      : std::min((int)result.quality, landscapeQualityMax);
+            if (i.id <= desiredQuality && i.id > bestQuality) bestQuality = i.id;
         }
+        if (bestQuality > 0) videoUrlResult.quality = bestQuality;
 
         // 找到当前清晰度下可用的视频
         std::vector<bilibili::DashMedia> codecs;
@@ -619,6 +616,23 @@ void BasePlayerActivity::onVideoPlayUrl(const bilibili::VideoUrlResult& result) 
             if (i.id == videoUrlResult.quality) {
                 codecs.emplace_back(i);
             }
+        }
+        if (codecs.empty()) {
+            // 目标清晰度不在返回列表里（常见于切换到账号拿不到的档位）：退回列表里
+            // 最高的一档，而不是继续用上一次的清晰度去索引一个空数组。
+            int highest = 0;
+            for (const auto& i : result.dash.video) highest = std::max(highest, (int)i.id);
+            for (const auto& i : result.dash.video) {
+                if (i.id == highest) codecs.emplace_back(i);
+            }
+            videoUrlResult.quality = highest;
+            if (!codecs.empty()) {
+                brls::Logger::warning("quality {} not offered, falling back to {}", (int)result.quality, highest);
+            }
+        }
+        if (codecs.empty()) {
+            brls::Logger::error("no video stream at any quality");
+            return;
         }
 
         // 匹配当前设定的视频编码

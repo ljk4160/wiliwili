@@ -426,7 +426,10 @@ public:
     // are part of the player. They are asked for by name, and the player
     // takes the one that fits the video. Trailing comma allows fallback to
     // default decoders for unsupported codecs (AV1, VP9) or unsupported profiles.
-    inline static std::string PLAYER_HWDEC_METHOD = "h264_ps5,hevc_ps5,";
+    // 末尾必须是 auto：控制台的硬解器只认一部分 profile/分辨率，遇到它吃不下
+    // 的流（换清晰度后尤其常见）时，没有 auto 兜底就没有软件解码接手，播放会
+    // 停在加载中、画面冻结，mpv 也不会再产生新帧（width/height 读出 0x0）。
+    inline static std::string PLAYER_HWDEC_METHOD = "h264_ps5,hevc_ps5,auto";
 #else
     inline static std::string PLAYER_HWDEC_METHOD = "auto-safe";
 #endif
@@ -462,6 +465,13 @@ private:
 #ifdef MPV_SW_RENDER
     const int PIXCEL_SIZE          = 4;
     int nvg_image                  = 0;
+    // 上一张纹理。换尺寸时不能当场删：它还挂在当前这一帧尚未 flush 的绘制
+    // 指令里，驱动会把名字当已释放处理。留到下一帧开头再删。
+    int nvg_image_stale            = 0;
+    // 渲染表面是按视频分辨率算的（有放大倍数上限），所以视频换了清晰度、
+    // 分辨率变了之后必须重算表面，否则一直用旧尺寸渲染。
+    int surface_video_w            = 0;
+    int surface_video_h            = 0;
 #if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
     const char *sw_format          = "abgr";
 #else

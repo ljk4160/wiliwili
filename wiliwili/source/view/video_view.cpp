@@ -4,6 +4,7 @@
 
 #include <limits>
 #include <cmath>
+#include <cstdio>
 
 #include <borealis/views/label.hpp>
 #include <borealis/views/progress_spinner.hpp>
@@ -1315,6 +1316,10 @@ void VideoView::setFullScreen(bool fs) {
     }
 
     brls::Logger::info("VideoView set fullscreen state: {}", fs);
+#ifdef PS5
+    std::fprintf(stderr, "[probe] setFullScreen(%d) enter, stack=%zu\n", (int)fs,
+                 brls::Application::getActivitiesStack().size());
+#endif
     if (fs) {
         this->unRegisterMpvEvent();
         auto container = new brls::Box();
@@ -1363,8 +1368,14 @@ void VideoView::setFullScreen(bool fs) {
             video->setSeasonAction(this->seasonAction);
         }
         container->addView(video);
+#ifdef PS5
+        std::fprintf(stderr, "[probe] new VideoView built, pushing fullscreen activity\n");
+#endif
         const auto activity = new brls::Activity(container);
         brls::Application::pushActivity(activity, brls::TransitionAnimation::NONE);
+#ifdef PS5
+        std::fprintf(stderr, "[probe] fullscreen activity pushed\n");
+#endif
         video->registerCommonActions(activity);
 #ifdef ALLOW_FULLSCREEN
         // 应用内全屏时同步切换窗口全屏

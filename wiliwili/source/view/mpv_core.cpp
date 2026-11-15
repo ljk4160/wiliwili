@@ -4,6 +4,7 @@
 
 #include <cstdlib>
 #include <clocale>
+#include <cstdio>
 #include <cmath>
 #include <pystring.h>
 #include <borealis/core/thread.hpp>
@@ -15,6 +16,42 @@
 #include "utils/number_helper.hpp"
 #include "utils/crash_helper.hpp"
 #include "view/mpv_core.hpp"
+
+#ifdef PS5
+#include <cstdarg>
+#include <cstdio>
+
+// 诊断探针：stderr 无缓冲，进程被内核直接收走时这一段也不会丢
+// （stdout 重定向到文件是全缓冲的，最后几行会跟着进程消失）。
+// 默认打开，WILIWILI_PROBE=0 关闭。
+namespace
+{
+bool probeOn()
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *value = std::getenv("WILIWILI_PROBE");
+        on                = (value && value[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+void probe(const char *format, ...) __attribute__((format(printf, 1, 2)));
+
+void probe(const char *format, ...)
+{
+    if (!probeOn()) return;
+    va_list args;
+    va_start(args, format);
+    std::fputs("[probe] ", stderr);
+    std::vfprintf(stderr, format, args);
+    std::fputc('\n', stderr);
+    va_end(args);
+}
+
+
+}  // namespace
+#endif
 
 #ifdef MPV_BUNDLE_DLL
 mpvSetOptionStringFunc mpvSetOptionString;
@@ -241,7 +278,11 @@ void MPVCore::on_update(void *self) {
             }
         }
 #endif
-#if defined(PS5) || defined(MPV_NO_FB) || defined(BOREALIS_USE_DEKO3D) || defined(BOREALIS_USE_D3D11)
+// 软件渲染时 PS5 在 draw() 里自己出像素；用 framebuffer 模式时必须在这里渲染进
+// FBO，否则没有任何地方调用 mpvRenderContextRender（draw() 的 FB 分支只做贴图），
+// 纹理永远是空的 —— 表现就是黑屏、或者卡住最后一帧。
+#if defined(MPV_NO_FB) || defined(BOREALIS_USE_DEKO3D) || defined(BOREALIS_USE_D3D11) || \
+    (defined(PS5) && defined(MPV_SW_RENDER))
         // 直接绘制到屏幕上，需要屏幕每刷新一次绘制一次，在 MPVCore 的绘制函数内部处理
         (void)flags;
 #else
@@ -257,7 +298,7 @@ void MPVCore::on_update(void *self) {
             mpvRenderContextReportSwap(MPVCore::instance().mpv_context);
             swRenderMs += brls::getCPUTimeUsec() / 1000.0 - start;
             double now = brls::getCPUTimeUsec() / 1000.0;
-            if (now - swRenderAt > 1000.0) {
+            if (now - swRenderAt > 10000.0) {
                 brls::Logger::info("mpv sw render: {:.1f} ms a second", swRenderMs);
                 swRenderMs = 0;
                 swRenderAt = now;
@@ -275,8 +316,13 @@ void MPVCore::on_update(void *self) {
 #ifdef PS5
             mpvRenderMs += brls::getCPUTimeUsec() / 1000.0 - start;
             double now = brls::getCPUTimeUsec() / 1000.0;
-            if (now - mpvRenderAt > 1000.0) {
-                brls::Logger::info("mpv render: {:.1f} ms a second", mpvRenderMs);
+            if (now - mpvRenderAt > 10000.0) {
+                // 同时报丢帧和实际帧率：渲染耗时高说明瓶颈在贴图/缩放，丢帧多而
+                // 渲染不忙说明瓶颈在解码。两个数一起看才分得清。
+                brls::Logger::info("mpv render: {:.1f} ms a second | drop out={} dec={} fps={:.1f}", mpvRenderMs,
+                                   (long)MPVCore::instance().getInt("frame-drop-count"),
+                                   (long)MPVCore::instance().getInt("decoder-frame-drop-count"),
+                                   MPVCore::instance().getDouble("estimated-vf-fps"));
                 mpvRenderMs = 0;
                 mpvRenderAt = now;
             }
@@ -406,6 +452,18 @@ void MPVCore::init() {
     mpvSetOption(mpv, "saturation", MPV_FORMAT_DOUBLE, &MPVCore::VIDEO_SATURATION);
     mpvSetOption(mpv, "hue", MPV_FORMAT_DOUBLE, &MPVCore::VIDEO_HUE);
     mpvSetOption(mpv, "gamma", MPV_FORMAT_DOUBLE, &MPVCore::VIDEO_GAMMA);
+
+#ifdef PS5
+    // 这台机器的 GL 实现在 4K->1080p 降采样上开销极大：默认的 lanczos 每帧要
+    // 110ms（60fps 下就是 6 倍实时，表现为疯狂丢帧）。双线性只要几毫秒，而 4K
+    // 降采样用双线性的画质损失肉眼几乎看不出来。
+    mpvSetOptionString(mpv, "dscale", "bilinear");
+    mpvSetOptionString(mpv, "scale", "bilinear");
+    mpvSetOptionString(mpv, "cscale", "bilinear");
+    mpvSetOptionString(mpv, "correct-downscaling", "no");
+    mpvSetOptionString(mpv, "linear-downscaling", "no");
+    mpvSetOptionString(mpv, "dither", "no");
+#endif
 
     if (MPVCore::LOW_QUALITY) {
         // Less cpu cost
@@ -541,6 +599,9 @@ void MPVCore::init() {
 
 
     // set observe properties
+    // 让 mpv 自己的诊断进应用日志：换清晰度/换编码时"流打不开""解码器选不到"
+    // 这类失败只有 mpv 知道，它不写日志就只能看到画面不动。
+    check_error(mpv_request_log_messages(mpv, "info"));
     check_error(mpvObserveProperty(mpv, 1, "core-idle", MPV_FORMAT_FLAG));
     check_error(mpvObserveProperty(mpv, 2, "eof-reached", MPV_FORMAT_FLAG));
     check_error(mpvObserveProperty(mpv, 3, "duration", MPV_FORMAT_INT64));
@@ -718,18 +779,14 @@ void MPVCore::clean() {
     }
 
 #ifdef MPV_SW_RENDER
-    if (pixels) {
-        free(pixels);
-        pixels = nullptr;
-        allocated_size = 0;
-        mpv_params[3].data = nullptr;
+    // 画布和它的像素缓冲在 clean() 里保留下来：关掉硬解、换解码器都会走
+    // init() -> clean() 这条路，如果这里把表面销毁，下一帧就要重建纹理，而
+    // "重建渲染纹理"本身就会随机把进程带走。画布尺寸固定，留着无害。
+    if (nvg_image_stale) {
+        nvgDeleteImage(brls::Application::getNVGContext(), nvg_image_stale);
+        nvg_image_stale = 0;
     }
-    if (nvg_image) {
-        nvgDeleteImage(brls::Application::getNVGContext(), nvg_image);
-        nvg_image = 0;
-    }
-    sw_size[0] = 0;
-    sw_size[1] = 0;
+    // 这里不释放 pixels，不删除 nvg_image，也不清 sw_size。
     this->is_dovi_mode = false;
 #endif
 }
@@ -784,10 +841,20 @@ void MPVCore::initializeVideo() {
     brls::Logger::debug("initializeGL");
 
     // create texture
+    // 视频渲染进这块纹理，再由下面的 shader 拉伸到窗口。上限 1080p：4K 的 RGBA
+    // 纹理每帧要 33MB 带宽，1080p 只要 8.3MB，放大交给 GPU。
+    int fboW = (int)brls::Application::windowWidth;
+    int fboH = (int)brls::Application::windowHeight;
+    if (fboW > 1920 || fboH > 1080) {
+        const float scale = std::min(1920.0f / (float)fboW, 1080.0f / (float)fboH);
+        fboW = (int)((float)fboW * scale);
+        fboH = (int)((float)fboH * scale);
+    }
+    brls::Logger::info("mpv fbo: {}x{} (window {}x{})", fboW, fboH, (int)brls::Application::windowWidth,
+                       (int)brls::Application::windowHeight);
     glGenTextures(1, &this->media_texture);
     glBindTexture(GL_TEXTURE_2D, this->media_texture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (int)brls::Application::windowWidth, (int)brls::Application::windowHeight,
-                 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, fboW, fboH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -806,6 +873,9 @@ void MPVCore::initializeVideo() {
     glBindTexture(GL_TEXTURE_2D, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, default_framebuffer);
     this->mpv_fbo.fbo = (int)this->media_framebuffer;
+    // mpv 按这两个值决定往多大区域渲染，必须和纹理一致，否则只画一部分。
+    this->mpv_fbo.w = fboW;
+    this->mpv_fbo.h = fboH;
     brls::Logger::debug("create fbo and texture done\n");
 
     // build and compile our shader program
@@ -865,22 +935,37 @@ void MPVCore::setFrameSize(brls::Rect r) {
 #else
     const static int mpvImageFlags = 0;
 #endif
-    int drawWidth  = rect.getWidth() * brls::Application::windowScale;
-    int drawHeight = rect.getHeight() * brls::Application::windowScale;
-    if (drawWidth == 0 || drawHeight == 0) return;
-
-    // 限制最大渲染缓冲为 1080p，避免 4k 渲染及 CPU 内存带宽卡顿 (3840x2160 每帧需要 33MB memcpy)
-    // 1080p 仅需 8.3MB，PS5 AMD GPU 在着色器中无损拉伸到 4K 屏幕 (0ms CPU 开销，流畅 60fps)
-    // 且固定 1080p 后在切换分辨率时尺寸不变，不销毁/重建纹理，杜绝纹理重建导致的闪退
-    const int maxW = 1920;
-    const int maxH = 1080;
-    if (drawWidth > maxW || drawHeight > maxH) {
-        float scale = std::min((float)maxW / drawWidth, (float)maxH / drawHeight);
-        drawWidth = (int)(drawWidth * scale);
-        drawHeight = (int)(drawHeight * scale);
+    // 一块画布用到底：只在第一次进入时创建纹理，之后无论进全屏、退全屏、
+    // 换清晰度、换视频都不销毁重建。
+    // 这台机器上"重建渲染纹理"本身就会随机把进程带走（内核记 0xa0020328 /
+    // 执行权限违规，信号不投递给应用，所以连崩溃报告都写不出来）。原代码注释
+    // 里写了要"固定尺寸不重建纹理"，但实现只做了上限截断，每次 rect 变化照样
+    // 重建，所以全屏和切清晰度都会崩。
+    //
+    // 画布固定 1080p：低分辨率视频由 GPU 放大，高分辨率视频缩小到 1080p 输出
+    // （4K 每帧要 33MB memcpy，1080p 只要 8.3MB）。尺寸可用
+    // /data/wiliwili/surface.txt 覆盖，内容形如 "1600x900"。
+    static int canvasW = 0;
+    static int canvasH = 0;
+    if (canvasW == 0) {
+        canvasW = 1920;
+        canvasH = 1080;
+        if (FILE *f = std::fopen("/data/wiliwili/surface.txt", "r")) {
+            int w = 0, h = 0;
+            if (std::fscanf(f, "%dx%d", &w, &h) == 2 && w >= 320 && h >= 180 && w <= 1920 && h <= 1080) {
+                canvasW = (w + 15) & ~15;
+                canvasH = (h + 1) & ~1;
+            }
+            std::fclose(f);
+        }
+#ifdef PS5
+        probe("canvas %dx%d (固定画布)", canvasW, canvasH);
+#endif
     }
-    drawWidth  = (drawWidth + 15) & ~15;
-    drawHeight = (drawHeight + 1) & ~1;
+    int drawWidth  = canvasW;
+    int drawHeight = canvasH;
+    const int maxW = canvasW;
+    const int maxH = canvasH;
 
     VideoInfo vi = this->getVideoInfo();
     bool isHlg  = (vi.gamma == "arib-std-b67" || vi.gamma == "hlg" ||
@@ -892,8 +977,8 @@ void MPVCore::setFrameSize(brls::Rect r) {
         vi.pixelFormat.find("dovi") != std::string::npos
     );
 
-    // Skip recreation if dimensions and format haven't changed
-    if (sw_size[0] == drawWidth && sw_size[1] == drawHeight && nvg_image != 0 && this->is_dovi_mode == isDovi) {
+    // 画布只有一块：建好之后就不再重建，除非色彩格式（DoVi）变了。
+    if (nvg_image != 0 && this->is_dovi_mode == isDovi) {
         return;
     }
     this->is_dovi_mode = isDovi;
@@ -908,36 +993,58 @@ void MPVCore::setFrameSize(brls::Rect r) {
     }
 
     if (pixels == nullptr) {
-        allocated_size = (size_t)maxW * maxH * PIXCEL_SIZE;
+        // 按 256 行对齐、宽度多留 64 像素：mpv 写出的量有可能超过它声明的
+        // sw_size 一点点，留出余量后越界只会落在自己的缓冲区里。
+        const size_t rows = (size_t)((maxH + 255) & ~255);
+        const size_t cols = (size_t)maxW + 64;
+        allocated_size    = cols * rows * PIXCEL_SIZE;
         if (posix_memalign(&pixels, 64, allocated_size + 64) != 0) {
             pixels = nullptr;
             brls::Logger::error("Failed to allocate {} bytes for video surface buffer", allocated_size);
             allocated_size = 0;
             return;
         }
-        memset(pixels, 0, allocated_size + 64);
+        std::memset(pixels, 0, allocated_size + 64);
         mpv_params[3].data = pixels;
+#ifdef PS5
+        probe("surface buffer %zu bytes for %dx%d (padded rows %zu)", allocated_size, maxW, maxH, rows);
+#endif
     }
 
-    if (nvg_image) {
-        nvgDeleteImage(brls::Application::getNVGContext(), nvg_image);
-        nvg_image = 0;
-    }
+#ifdef PS5
+    probe("setFrameSize in %dx%d (was %dx%d) nvg=%d paused=%d", drawWidth, drawHeight, sw_size[0], sw_size[1], nvg_image,
+          (int)this->video_paused);
+#endif
+    // 先建新的，成功了再删旧的：中间不留"没有纹理"的空窗。原来的写法先删后建，
+    // 一旦创建失败就永久停在 nvg_image == 0，视频再也不出来。
+    auto *vg    = brls::Application::getNVGContext();
+    int created = 0;
     if (isDovi) {
         sw_format = "p010";
         pitch     = drawWidth * 2;
-        nvg_image = nvgCreateImageR16(brls::Application::getNVGContext(), drawWidth, drawHeight * 3 / 2, mpvImageFlags,
-                                      (const unsigned char *)pixels);
+        created   = nvgCreateImageR16(vg, drawWidth, drawHeight * 3 / 2, mpvImageFlags,
+                                    (const unsigned char *)pixels);
     } else {
 #if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
         sw_format = "abgr";
 #else
         sw_format = "rgba";
 #endif
-        pitch     = PIXCEL_SIZE * drawWidth;
-        nvg_image = nvgCreateImageRGBA(brls::Application::getNVGContext(), drawWidth, drawHeight, mpvImageFlags,
-                                       (const unsigned char *)pixels);
+        pitch   = PIXCEL_SIZE * drawWidth;
+        created = nvgCreateImageRGBA(vg, drawWidth, drawHeight, mpvImageFlags, (const unsigned char *)pixels);
     }
+    if (created == 0) {
+        brls::Logger::error("nvgCreateImage failed for {}x{}", drawWidth, drawHeight);
+        return;
+    }
+    if (nvg_image) {
+        if (nvg_image_stale) nvgDeleteImage(vg, nvg_image_stale);
+        nvg_image_stale = nvg_image;
+    }
+    nvg_image = created;
+#ifdef PS5
+    probe("setFrameSize out %dx%d nvg=%d", drawWidth, drawHeight, nvg_image);
+#endif
 
     sw_size[0] = drawWidth;
     sw_size[1] = drawHeight;
@@ -948,7 +1055,13 @@ void MPVCore::setFrameSize(brls::Rect r) {
     // 只有在视频暂停时调整纹理尺寸才需要强制渲染一次（视频画面会被清空为黑色）
     // 播放中绝对不能主动调用 mpvRenderContextRender，否则在视频切换/切分辨率时会导致滤镜链崩溃
     if (this->video_paused && !this->video_stopped) {
+#ifdef PS5
+        probe("setFrameSize force render in");
+#endif
         mpvRenderContextRender(mpv_context, mpv_params);
+#ifdef PS5
+        probe("setFrameSize force render out");
+#endif
         mpvRenderContextReportSwap(mpv_context);
         this->redraw = true;
     }
@@ -1015,30 +1128,79 @@ bool MPVCore::isValid() { return mpv_context != nullptr; }
 
 void MPVCore::draw(brls::Rect area, float alpha) {
     if (mpv_context == nullptr) return;
+#ifdef MPV_SW_RENDER
+    // 上一帧的绘制指令已经 flush 完，这时才安全删掉退役的纹理。
+    if (nvg_image_stale) {
+        nvgDeleteImage(brls::Application::getNVGContext(), nvg_image_stale);
+        nvg_image_stale = 0;
+    }
+#endif
     // The picture is put on the screen in two steps: the frame is resized to
     // the place the picture takes, and then the texture is drawn.
     stage::Marker marker("video draw");
     VideoInfo vi        = this->getVideoInfo();
-    bool isHlg          = (vi.gamma == "arib-std-b67" || vi.gamma == "hlg" ||
-                           (dovi_meta.meta[0] > 0.5f && dovi_meta.meta[1] > 0.5f));
-    bool isDoviProfile5 = !isHlg && (
+#ifdef PS5
+    {
+        static long long lastW = -1, lastH = -1;
+        if ((long long)vi.width != lastW || (long long)vi.height != lastH) {
+            lastW = (long long)vi.width;
+            lastH = (long long)vi.height;
+            probe("video now %lldx%lld", lastW, lastH);
+        }
+
+        // 4K 的帧上传到这条 GL 要 85~100ms，1080p 只要 3ms（像素 4 倍、开销 30 倍）。
+        // 所以超过 1080p 的输入先在 CPU 侧用 swscale 缩下来再上传：swscale 的 SIMD
+        // 路径远比这条 GL 路径快，而画布本来也就是 1080p，画质没有额外损失。
+        static int vfApplied = 0;
+        const bool wantScale = (vi.height > 1080) || (vi.width > 1920);
+        if (wantScale && vfApplied == 0) {
+            vfApplied = 1;
+            command_async("vf", "set", "scale=-2:1080");
+            brls::Logger::info("mpv: {}x{} 输入，先在 CPU 缩到 1080p 再上传", (long long)vi.width, (long long)vi.height);
+        } else if (!wantScale && vfApplied == 1) {
+            vfApplied = 0;
+            command_async("vf", "set", "");
+            brls::Logger::info("mpv: 输入不超过 1080p，去掉 CPU 缩放");
+        }
+    }
+#endif
+    [[maybe_unused]] bool isHlg          = (vi.gamma == "arib-std-b67" || vi.gamma == "hlg"
+#ifdef MPV_SW_RENDER
+                           || (dovi_meta.meta[0] > 0.5f && dovi_meta.meta[1] > 0.5f)
+#endif
+    );
+    [[maybe_unused]] bool isDoviProfile5 = !isHlg && (
+#ifdef MPV_SW_RENDER
         (dovi_meta.meta[0] > 0.5f && dovi_meta.meta[1] < 0.5f) ||
+#endif
         vi.colormatrix.find("ipt") != std::string::npos ||
         vi.codec.find("dv") != std::string::npos ||
         vi.pixelFormat.find("dovi") != std::string::npos
     );
 
-    if (!(this->rect == area) || this->is_dovi_mode != isDoviProfile5) {
+    if (!(this->rect == area)
+#ifdef MPV_SW_RENDER
+        // clean() 释放像素缓冲和纹理并把 sw_size 归零，而切硬解/切编码/换着色器
+        // 都走这条路且 rect 不变：只比 rect 的话这里会永远跳过重建，draw() 每帧
+        // 都在下面的判空处返回，画面就再也出不来了。
+        || this->is_dovi_mode != isDoviProfile5 || pixels == nullptr || nvg_image == 0 ||
+        (int)vi.width != this->surface_video_w || (int)vi.height != this->surface_video_h
+#endif
+    ) {
         setFrameSize(area);
     }
 
 #ifdef MPV_SW_RENDER
-    if (!pixels) {
+    if (!pixels || nvg_image == 0) {
+        static int warned = 0;
+        if (warned++ < 3)
+            brls::Logger::error("video surface is not ready (pixels={}, nvg_image={})", (void *)pixels, nvg_image);
         return;
     }
 
 #ifdef PS5
     uint64_t updateFlags = mpvRenderContextUpdate(mpv_context);
+
     static double renderTotalMs = 0;
     static int renderCount = 0;
     if (updateFlags & MPV_RENDER_UPDATE_FRAME) {
@@ -1193,6 +1355,8 @@ void MPVCore::draw(brls::Rect area, float alpha) {
     // of the interface must not cut it.
     GLboolean scissorTest = glIsEnabled(GL_SCISSOR_TEST);
     glDisable(GL_SCISSOR_TEST);
+    // 画面在屏幕上的位置由 setFrameSize() 算好的 NDC 顶点决定，这里必须用整个窗口
+    // 的视口：视口再按 rect 缩小会变成二次变换，画面被放大并裁掉（表现为"画面不全"）。
     glViewport(0, 0, (GLsizei)brls::Application::windowWidth, (GLsizei)brls::Application::windowHeight);
     // The state of whoever drew before: the video is a flat picture in the
     // foreground, and the depth test and the culling of the faces would
